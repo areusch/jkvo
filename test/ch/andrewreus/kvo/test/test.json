@@ -1,0 +1,9 @@
+{
+    "__name__": "Test",
+    "happyFace": 2,
+    "v": "a string",
+    "subobj": {
+        "__name__": "SubObj",
+        "test": 3
+    }
+}
