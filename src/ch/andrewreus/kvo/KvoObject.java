@@ -1,9 +1,10 @@
 package ch.andrewreus.kvo;
 
 public class KvoObject {
+	
 	protected abstract class KvoProperty<T> {
-		T value_;
-		boolean isUpdating_;
+		protected T value_;
+		private boolean isUpdating_;
 		
 		public KvoProperty(T initialValue) {
 			value_ = initialValue;
@@ -12,8 +13,9 @@ public class KvoObject {
 		public T get() {
 			return value_;
 		}
+
 		
-		void update(T value) {
+		public void update(T value) {
 			if (isUpdating_) {
 				throw new IllegalStateException("Alreadying updating the given value!");
 			}

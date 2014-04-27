@@ -4,7 +4,7 @@ import(
 	"encoding/json"
 	"fmt"
 	"io"
-	"reflect"
+	"os"
 	"strings"
 	"text/template"
 )
@@ -12,6 +12,7 @@ import(
 
 type KvoTemplateParams struct {
 	Package string
+	OuterClass string
 	Types []KvoType
 }
 
@@ -19,39 +20,48 @@ var kvoTemplate = template.Must(template.New("kvo").Parse(`
 package {{.Package}};
 
 import ch.andrewreus.kvo.KvoObject;
+import java.util.LinkedList;
+
+public class {{.OuterClass}} {
 
 {{range $kvoType := .Types}}
-public class {{$kvoType.Name}} extends KvoObject {
+public static class {{$kvoType.Name}} extends KvoObject {
 {{range $prop := $kvoType.Properties}}
     // Key "{{$prop.Key}}"
     public interface {{$prop.CamelCaseKey}}Subscriber {
         public void didUpdate{{$prop.CamelCaseKey}}({{$prop.Type}} old);
     }
 
-    public KvoProperty<{{$prop.Type}}> prop{{$prop.CamelCaseKey}}_ = KvoProperty<{{$prop.Type}}>({{$prop.InitialValue}}) {
-        LinkedList<{{$prop.CamelCaseKey}}Subscriber> subscribers_ = new LinkedList<{{$prop.CamelCaseKey}}>();
+    private KvoObject.KvoProperty<{{$prop.Type}}> prop{{$prop.CamelCaseKey}}_ = new KvoObject.KvoProperty<{{$prop.Type}}>({{$prop.InitialValue}}) {
 
         protected void notifySubscribers({{$prop.Type}} old) {
-            for (Prop{{$prop.CamelCaseKey}}Subscriber s : subscribers_) {
-                s.didUpdate{{$prop.CamelCaseKey}}(old);
-            }
+            notify{{$prop.CamelCaseKey}}Subscribers(old);
         }
     };
+
+    public LinkedList<{{$prop.CamelCaseKey}}Subscriber> subscribersTo{{$prop.CamelCaseKey}} = new LinkedList<{{$prop.CamelCaseKey}}Subscriber>();
+
+    private void notify{{$prop.CamelCaseKey}}Subscribers({{$prop.Type}} old) {
+        for ({{$prop.CamelCaseKey}}Subscriber s : subscribersTo{{$prop.CamelCaseKey}}) {
+            s.didUpdate{{$prop.CamelCaseKey}}(old);
+        }
+    }
 
     public {{$prop.Type}} get{{$prop.CamelCaseKey}}() {
         return prop{{$prop.CamelCaseKey}}_.get();
     }
 
-    public void subscribeTo{{$prop.CamelCaseKey}}(Prop{{$prop.CamelCaseKey}}Listener subscriber) {
-        prop{{$prop.CamelCaseKey}}_.addSubscriber(subscriber);
+    public void subscribeTo{{$prop.CamelCaseKey}}({{$prop.CamelCaseKey}}Subscriber subscriber) {
+        subscribersTo{{$prop.CamelCaseKey}}.add(subscriber);
     }
 
-    public set{{$prop.CamelCaseKey}}({{$prop.Type}} value) {
-        prop{{$prop.CamelCaseKey}}_.set(value);
+    public void set{{$prop.CamelCaseKey}}({{$prop.Type}} value) {
+        prop{{$prop.CamelCaseKey}}_.update(value);
     }
 {{end}}
 }
 {{end}}
+}
 `))
 
 type KvoObject map[string]interface{}
@@ -73,6 +83,22 @@ type KvoProperty struct {
 	Key string
 	Type string
 	InitialValue string
+	IsExternal bool
+}
+
+func (p KvoProperty) IsInitialized() bool {
+	return p.Key != "" && p.Type != "" && (p.IsComplex() || p.IsExternal || p.InitialValue != "")
+}
+
+var primitiveTypes []string = []string{"Boolean", "Integer", "Double", "String"}
+
+func (p KvoProperty) IsComplex() bool {
+	for _, pt := range primitiveTypes {
+		if p.Type == pt {
+			return false
+		}
+	}
+	return true
 }
 
 type KvoType struct {
@@ -85,34 +111,53 @@ func (k KvoProperty) CamelCaseKey() string {
 }
 
 func ParseAndValidate(r io.Reader) (obj KvoObject, err error) {
-	if err = json.NewDecoder(r).Decode(&obj); err != nil {
+	d := json.NewDecoder(r)
+	d.UseNumber()  // Do this so we can detect "0.0" floats.
+	if err = d.Decode(&obj); err != nil {
 		return
 	}
 	return
 }
 
-func TypeNameFromKind(k reflect.Kind, enclosingType string, propName string, val interface{}) (typeName string, initialValue string, isComplex bool) {
-	switch k {
-	case reflect.Map:
-		mapVal := val.(map[string]interface{})
-		if mapTypeName, ok := mapVal["__name__"]; ok {
-			typeName = mapTypeName.(string)
+func SpecEntryToProperty(key string, value interface{}, enclosingType string) (prop KvoProperty) {
+	prop.Key = key
+	switch value.(type) {
+	case map[string]interface{}:
+		// The value is either a sub-field or an external type.
+		mapValue := value.(map[string]interface{})
+		if mapTypeName, ok := mapValue["__name__"]; ok {
+			prop.Type = mapTypeName.(string)
+			if javaPkg, ok := mapValue["__package__"]; ok {
+				prop.Type = javaPkg.(string) + "." + prop.Type
+  			prop.IsExternal = true
+			}
 		} else {
-			typeName = enclosingType + "_" + propName
+			prop.Type = enclosingType + "_" + key
 		}
-		initialValue = "new " + typeName + "()";
-		isComplex = true
-	case reflect.Bool:
-		typeName = "boolean"
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		typeName = "int"
-		initialValue = "0";
-	case reflect.Float32, reflect.Float64:
-		typeName = "double"
-		initialValue = "0.0";
-	case reflect.String:
-		typeName = "String"
-		initialValue = "\"\"";
+		if !prop.IsExternal {
+			prop.InitialValue = "new " + prop.Type + "()";
+		} else {
+			prop.InitialValue = "null";
+		}
+	case bool:
+		prop.Type = "Boolean"
+		if value.(bool) {
+			prop.InitialValue = "true"
+		} else {
+			prop.InitialValue = "false"
+		}
+	case json.Number:
+		numValue := value.(json.Number)
+		if strings.Index(numValue.String(), ".") != -1 {
+			prop.Type = "Double"
+			prop.InitialValue = numValue.String()
+		} else {
+			prop.Type = "Integer"
+			prop.InitialValue = numValue.String()
+		}
+	case string:
+		prop.Type = "String"
+		prop.InitialValue = value.(string)
 	}
 	return
 }
@@ -123,37 +168,36 @@ func TypeToVarList(typeName string, obj KvoObject, types *[]KvoType) error {
 		if k == "__name__" {
 			continue
 		}
-		v := reflect.ValueOf(t)
-		typeName, initialValue, isComplex := TypeNameFromKind(v.Kind(), typeName, k, t)
-		if typeName == "" {
+		prop := SpecEntryToProperty(k, t, typeName)
+		if !prop.IsInitialized() {
 			return ValidationError{
-			Problem: "Don't know how to generate for value of kind " + v.Kind().String(),
+			Problem: fmt.Sprintf("Don't know how to generate for value %#v", t),
 			Field: typeName + "_" + k}
 		}
-		if isComplex {
-			if err := TypeToVarList(typeName, t.(map[string]interface{}), types); err != nil {
+		if !prop.IsExternal && prop.IsComplex() {
+			if err := TypeToVarList(prop.Type, t.(map[string]interface{}), types); err != nil {
 				return err
 			}
 		}
-		kt.Properties = append(kt.Properties, KvoProperty{Key: k, Type: typeName, InitialValue: initialValue})
+		kt.Properties = append(kt.Properties, prop)
 	}
 	*types = append(*types, kt)
 	return nil
 }
 
-func Generate(javaPkg string, o map[string]interface{}, w io.Writer) (error) {
+func Generate(javaPkg string, outerClass string, o map[string]interface{}, w io.Writer) (error) {
 	if javaPkg == "" {
 		return ValidationError{Problem: "Must specify a Java package.", Field: ""}
 	}
-	params := KvoTemplateParams{Package: javaPkg, Types: make([]KvoType, 0)}
-	typeName, _, _ := TypeNameFromKind(reflect.ValueOf(o).Kind(), "", "", o)
-	if typeName == "_" {
+	params := KvoTemplateParams{Package: javaPkg, OuterClass: outerClass, Types: make([]KvoType, 0)}
+	prop := SpecEntryToProperty("", o, "")
+	if prop.Type == "_" {
 		return ValidationError{Problem: "Outermost object must specify a type name with key __name__", Field: ""}
 	}
-	if err := TypeToVarList(typeName, o, &params.Types); err != nil {
+	if err := TypeToVarList(prop.Type, o, &params.Types); err != nil {
 		return err
 	}
-	fmt.Println(params)
+	fmt.Fprintf(os.Stderr, "Params: %v\n", params)
 
 	if err := kvoTemplate.Execute(w, params); err != nil {
  		return err
